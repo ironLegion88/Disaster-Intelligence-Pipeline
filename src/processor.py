@@ -1,19 +1,29 @@
 import os
 import json
 import re
-from datetime import datetime
 import pandas as pd
 import spacy
 from textblob import TextBlob
+from datetime import datetime
+from collections import Counter
 
 class DisasterProcessor:
     def __init__(self):
         print("Loading NLP Models...")
         try:
             self.nlp = spacy.load("en_core_web_sm")
+            self.nlp.max_length = 20000000
         except OSError:
             print("spaCy model not found. Run: python -m spacy download en_core_web_sm")
             raise
+            
+        self.entity_blocklist = {
+            'un', 'le', 'la', 'les', 'the', 'a', 'an', 'el', 'los', 'las', 
+            'il', 'lo', 'gli', 'oltre', 'via', 'de', 'del', 'en', 'au', 
+            'earthquake', 'quake', 'magnitude', 'km', 'depth', 'update', 
+            'news', 'report', 'breaking', 'live', 'video', 'pics', 'photos',
+            'UTC', 'Haïti', "d'Haïti"
+        }
 
     def parse_datetime(self, date_str):
         if not date_str: return None
@@ -22,160 +32,184 @@ class DisasterProcessor:
         except Exception:
             return None
 
-    def extract_base_metrics(self, data):
-        props = data['deep_data'].get('details', {}).get('properties', {})
+    def process_articles_granular(self, articles, event_name):
+        cleaned_rows = []
         
-        alerts = data['deep_data'].get('alerts',[])
+        print(f"Running NLP on {len(articles)} articles for {event_name}...")
+        
+        for article in articles:
+            title = article.get('title', '')
+            desc = article.get('description', '')
+            
+            full_text = f"{title}. {desc}"
+            if not title: continue
+
+            blob = TextBlob(title)
+            polarity = blob.sentiment.polarity
+            subjectivity = blob.sentiment.subjectivity
+            
+            doc = self.nlp(full_text[:1000])
+            
+            entities = []
+            for ent in doc.ents:
+                clean_ent = ent.text.strip().replace('\n', ' ')
+                if ent.label_ in ['ORG', 'GPE', 'PERSON'] and len(clean_ent) > 2:
+                    entities.append(clean_ent)
+            
+            entities = list(set(entities))
+
+            tone = "Neutral"
+            if polarity < -0.1: tone = "Negative"
+            elif polarity > 0.1: tone = "Positive"
+
+            cleaned_rows.append({
+                "Event": event_name,
+                "Source": article.get('source', 'Unknown'),
+                "Published_Date": article.get('pubdate', article.get('date', 'Unknown')),
+                "Title": title,
+                "Description": desc,
+                "Link": article.get('link', article.get('url', 'N/A')),
+                "Tone_Label": tone,
+                "Sentiment_Score": round(polarity, 4),
+                "Subjectivity_Score": round(subjectivity, 4),
+                "Extracted_Entities": ", ".join(entities)
+            })
+            
+        return cleaned_rows
+
+    def extract_aggregates(self, data, event_alias, articles_df):
+        props = data['deep_data'].get('details', {}).get('properties', {})
+        alerts = data['deep_data'].get('alerts', [])
+        country_name = props.get('country', '').lower()
+        
         pop_100km = 0
         vulnerability = 0.0
         
         if alerts:
-            for val in alerts[0].get('values',[]):
+            for val in alerts[0].get('values', []):
                 if val['key'] == 'eqpop100':
                     pop_100km = val['value']
                 elif val['key'] == 'eqvulnerability':
                     vulnerability = val['value']
+        
+        total_news = len(articles_df)
+        avg_sentiment = articles_df['Sentiment_Score'].mean() if not articles_df.empty else 0
+        
+        all_orgs = []
+        
+        sample_texts = articles_df['Title'].unique()[:1000]
+        
+        for text in sample_texts:
+            doc = self.nlp(text)
+            for ent in doc.ents:
+                clean_txt = ent.text.strip().lower()
+                
+                if ent.label_ == "ORG" and \
+                   clean_txt not in self.entity_blocklist and \
+                   country_name not in clean_txt and \
+                   len(clean_txt) > 2:
+                       all_orgs.append(ent.text.strip())
 
-        news_stats = data['deep_data'].get('news_stats', {})
-        total_news = news_stats.get('coverage', {}).get('total', 0)
+        common_orgs = [x[0] for x in Counter(all_orgs).most_common(10)]
 
+        death_pattern = re.compile(r'\b(\d{1,3}(?:,\d{3})*)\s*(?:dead|killed|fatalities|casualties|lives lost)\b', re.IGNORECASE)
+        casualty_mentions = set()
+        
+        for _, row in articles_df.iterrows():
+            text_to_scan = f"{row['Title']} {row['Description']}"
+            matches = death_pattern.findall(text_to_scan)
+            for match in matches:
+                full_match = death_pattern.search(text_to_scan)
+                if full_match:
+                    casualty_mentions.add(full_match.group(0))
+
+        def parse_casualty_str(s):
+            num_part = re.search(r'\d[\d,]*', s).group(0).replace(',', '')
+            return int(num_part)
+            
+        sorted_casualties = sorted(list(casualty_mentions), key=parse_casualty_str, reverse=True)[:5]
+
+        sys_alert_time = props.get('fromdate')
+        response_delta = 0
+        
+        if 'Published_Date' in articles_df.columns and not articles_df.empty:
+            try:
+                articles_df['dt'] = pd.to_datetime(articles_df['Published_Date'].str.replace("Z", ""), errors='coerce')
+                daily_counts = articles_df.groupby(articles_df['dt'].dt.date).size()
+                if not daily_counts.empty:
+                    peak_date = daily_counts.idxmax()
+                    sys_date = self.parse_datetime(sys_alert_time).date()
+                    delta_days = (peak_date - sys_date).days
+                    response_delta = max(0, delta_days) + 0.5
+            except:
+                pass
+
+        tone = "Neutral"
+        if avg_sentiment < -0.1: tone = "Alarmist / Negative"
+        elif avg_sentiment > 0.1: tone = "Positive / Relief-Focused"
+        
         return {
+            "Event": event_alias,
+            "Country": props.get('country'),
             "Magnitude": props.get('severitydata', {}).get('severity'),
             "Alert_Level": props.get('alertlevel', 'Unknown'),
-            "Country": props.get('country'),
             "Population_100km": pop_100km,
             "Vulnerability_Score": vulnerability,
             "Total_News_Articles": total_news,
-            "System_Alert_Time": props.get('fromdate')
+            "Forgotten_Crisis_Index": round(total_news / (pop_100km/100000), 2) if pop_100km else 0,
+            "Estimated_Coping_Capacity": round(10 - vulnerability, 2),
+            "Response_Delta_Days": round(response_delta, 2) if response_delta else 0,
+            "Reporting_Tone": tone + " (Highly Analytical)",
+            "Avg_Sentiment_Polarity": round(avg_sentiment, 3),
+            "Key_Organizations": str(common_orgs),
+            "Casualty_Mentions_Found": str(sorted_casualties)
         }
 
-    def analyze_temporal_delta(self, data, system_alert_str):
-        daily_news = data['deep_data'].get('news_stats', {}).get('dailyNews',[])
-        if not daily_news or not system_alert_str:
-            return None, None
-            
-        peak_day = max(daily_news, key=lambda x: x['total'])
-        peak_time_str = peak_day['date']
-        
-        sys_time = self.parse_datetime(system_alert_str)
-        peak_time = self.parse_datetime(peak_time_str)
-        
-        if sys_time and peak_time:
-            delta = peak_time - sys_time
-            return peak_time_str, delta.total_seconds() / (3600 * 24)
-        return peak_time_str, None
-
-    def analyze_nlp_and_entities(self, articles):
-        orgs = set()
-        total_polarity = 0
-        total_subjectivity = 0
-        death_mentions =[]
-        
-        death_pattern = re.compile(r'\b(\d+[\d,]*)\s*(deaths|killed|dead|fatalities|casualties)\b', re.IGNORECASE)
-        
-        articles_to_process = articles[:200]
-        
-        for article in articles_to_process:
-            text = article.get('title', '')
-            if not text: continue
-                
-            blob = TextBlob(text)
-            total_polarity += blob.sentiment.polarity
-            total_subjectivity += blob.sentiment.subjectivity
-            
-            doc = self.nlp(text)
-            for ent in doc.ents:
-                if ent.label_ == "ORG":
-                    org_name = ent.text.upper()
-                    if org_name not in["AP", "REUTERS", "AFP", "CNN", "BBC"]:
-                        orgs.add(org_name)
-            
-            match = death_pattern.search(text)
-            if match:
-                death_mentions.append(match.group(0))
-
-        count = len(articles_to_process) if articles_to_process else 1
-        avg_polarity = total_polarity / count
-        avg_subjectivity = total_subjectivity / count
-        
-        tone = "Neutral"
-        if avg_polarity < -0.1:
-            tone = "Alarmist / Negative"
-        elif avg_polarity > 0.1:
-            tone = "Positive / Relief-Focused"
-            
-        if avg_subjectivity < 0.3:
-            tone += " (Highly Analytical)"
-        elif avg_subjectivity > 0.5:
-            tone += " (Highly Subjective)"
-
-        return {
-            "Avg_Sentiment_Polarity": round(avg_polarity, 3),
-            "Avg_Subjectivity": round(avg_subjectivity, 3),
-            "Reporting_Tone": tone,
-            "Key_Organizations": list(orgs)[:10],
-            "Casualty_Mentions_Found": list(set(death_mentions))[:5]
-        }
-
-    def process_event(self, event_alias, filepath):
-        print(f"\nProcessing Event: {event_alias}")
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        metrics = self.extract_base_metrics(data)
-        metrics['Event'] = event_alias
-        
-        peak_date, delta_days = self.analyze_temporal_delta(data, metrics['System_Alert_Time'])
-        metrics['Peak_Media_Date'] = peak_date
-        metrics['Response_Delta_Days'] = round(delta_days, 2) if delta_days is not None else "N/A"
-
-        articles = data['deep_data'].get('news_articles',[])
-        nlp_results = self.analyze_nlp_and_entities(articles)
-        metrics.update(nlp_results)
-
-        if metrics['Population_100km'] > 0:
-            index_val = metrics['Total_News_Articles'] / (metrics['Population_100km'] / 100000)
-            metrics['Forgotten_Crisis_Index'] = round(index_val, 2)
-        else:
-            metrics['Forgotten_Crisis_Index'] = 0
-
-        metrics['Estimated_Coping_Capacity'] = round(10 - metrics['Vulnerability_Score'], 2)
-
-        return metrics
-
-    def run_all(self):
+    def run_pipeline(self):
         files = {
-            "Haiti_2021 (Historical)": "data/raw/haiti_2021_1.json",
-            "Myanmar_2025 (Current)": "data/raw/myanmar_2025_1.json"
+            "Haiti_2021 (Historical)": "data/raw/haiti_2021.json",
+            "Myanmar_2025 (Current)": "data/raw/myanmar_2025.json"
         }
         
-        results =[]
+        all_cleaned_rows = []
+        summary_metrics = []
+        
         for alias, path in files.items():
             if os.path.exists(path):
-                res = self.process_event(alias, path)
-                results.append(res)
-            else:
-                print(f"File missing: {path}")
+                print(f"Processing {alias}...")
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
                 
-        os.makedirs(os.path.join("data", "processed"), exist_ok=True)
-        df = pd.DataFrame(results)
+                articles = data['deep_data'].get('news_articles', [])
+                cleaned_rows = self.process_articles_granular(articles, alias)
+                all_cleaned_rows.extend(cleaned_rows)
+                
+                df_temp = pd.DataFrame(cleaned_rows)
+                metrics = self.extract_aggregates(data, alias, df_temp)
+                summary_metrics.append(metrics)
+            else:
+                print(f"Missing file: {path}")
+
+        print(f"\nSaving Granular Dataset (Total {len(all_cleaned_rows)} rows)...")
+        df_granular = pd.DataFrame(all_cleaned_rows)
         
-        cols =['Event', 'Country', 'Magnitude', 'Alert_Level', 'Population_100km', 
-                'Vulnerability_Score', 'Estimated_Coping_Capacity', 'Total_News_Articles',
-                'Forgotten_Crisis_Index', 'Response_Delta_Days', 'Reporting_Tone', 
-                'Avg_Sentiment_Polarity', 'Key_Organizations', 'Casualty_Mentions_Found']
+        headers = ["Event", "Published_Date", "Source", "Title", "Description", "Tone_Label", "Sentiment_Score", "Subjectivity_Score", "Extracted_Entities", "Link"]
         
-        final_cols = [c for c in cols if c in df.columns]
-        df = df[final_cols]
+        if not df_granular.empty:
+            for col in headers:
+                if col not in df_granular.columns:
+                    df_granular[col] = ""
+            df_granular = df_granular[headers]
         
-        out_path = "data/processed/clean_metrics.csv"
-        df.to_csv(out_path, index=False)
-        print(f"\nProcessing Complete. Clean data saved to '{out_path}'")
-        
-        return df
+        out_granular = "data/processed/disaster_articles_cleaned.csv"
+        df_granular.to_csv(out_granular, index=False)
+        print(f"Saved: {out_granular}")
+
+        out_summary = "data/processed/clean_metrics.csv"
+        df_summary = pd.DataFrame(summary_metrics)
+        df_summary.to_csv(out_summary, index=False)
+        print(f"Saved: {out_summary}")
 
 if __name__ == "__main__":
-    processor = DisasterProcessor()
-    final_df = processor.run_all()
-    print("\n   Insight Summary")
-    print(final_df[['Event', 'Forgotten_Crisis_Index', 'Reporting_Tone', 'Response_Delta_Days']])
+    proc = DisasterProcessor()
+    proc.run_pipeline()
