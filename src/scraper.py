@@ -1,121 +1,140 @@
+import os
 import requests
-import pandas as pd
 import json
-import time
 from datetime import datetime, timedelta
 
-class DisasterScraper:
-    GDACS_API_URL = "https://www.gdacs.org/gdacsapi/api/Events" 
-    RELIEFWEB_API_URL = "https://api.reliefweb.int/v1/reports"
+class GDACSDeepScraper:
+    BASE_URL = "https://www.gdacs.org/gdacsapi/api"
 
     def __init__(self):
         self.session = requests.Session()
+        os.makedirs(os.path.join("data", "raw"), exist_ok=True)
 
-    def fetch_event_data(self, start_date, end_date, event_type="EQ", country=None):
+    def search_events(self, start_date, end_date, country, event_type="EQ", min_mag=7.0):
         
-        print(f"[*] Querying GDACS API for {event_type} between {start_date} and {end_date}...")
+        print(f"\nSearching GDACS for {event_type} in {country} ({start_date} to {end_date})...")
         
+        endpoint = f"{self.BASE_URL}/Events/geteventlist/search"
         params = {
-            "fromdate": start_date,
-            "todate": end_date,
-            "eventtypes": event_type
+            "eventlist": event_type,
+            "fromDate": start_date,
+            "toDate": end_date
         }
 
         try:
-            response = self.session.get(self.GDACS_API_URL, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
+            resp = self.session.get(endpoint, params=params, timeout=50000)
+            resp.raise_for_status()
+            data = resp.json()
+            features = data.get('features',[])
             
-            features = data.get('features', []) if 'features' in data else data
+            candidates =[]
+            for feat in features:
+                props = feat.get('properties', {})
+                ev_country = props.get('country', '').lower()
+                
+                mag = props.get('severitydata', {}).get('severity', 0)
+                
+                if country.lower() in ev_country and mag >= min_mag:
+                    candidates.append(props)
             
-            matched_events = []
-            for event in features:
-                props = event.get('properties', event)
+            if not candidates:
+                print("    No events found matching criteria.")
+                return None
                 
-                event_countries = props.get('country', '').lower()
-                if country and country.lower() not in event_countries:
-                    continue
-                
-                mag = props.get('mag', props.get('magnitude', 0))
-                if mag < 5.5: 
-                    continue
-
-                print(f"    -> Found Candidate: {props.get('name')} (Mag: {mag})")
-                
-                processed_event = self._process_single_event(props)
-                matched_events.append(processed_event)
-                
-            return matched_events
+            best_match = max(candidates, key=lambda x: x.get('severitydata', {}).get('severity', 0))
+            print(f"    Match Found: {best_match['name']} (Mag: {best_match.get('severitydata', {}).get('severity')}) - EventID: {best_match['eventid']}")
+            return best_match
 
         except Exception as e:
-            print(f"[!] GDACS API Failed: {e}")
-            return []
+            print(f"    Search failed: {e}")
+            return None
 
-    def _process_single_event(self, props):
-        event_date = props.get('fromdate', props.get('time'))
-        country = props.get('country')
+    def get_deep_data(self, eventtype, eventid):
         
-        event_data = {
-            "event_id": props.get('eventid'),
-            "name": props.get('name'),
-            "country": country,
-            "date": event_date,
-            "magnitude": props.get('mag', props.get('magnitude')),
-            "alert_level": props.get('alertlevel', 'Green').lower(),
-            "population_exposed": props.get('population', 0),
-            "latitude": props.get('latitude'),
-            "longitude": props.get('longitude')
+        print(f"Getting Deep Data for EventID {eventid}...")
+        full_event_data = {"eventid": eventid, "eventtype": eventtype}
+
+        print("    Fetching Main Event Data...")
+        ev_data_endpoint = f"{self.BASE_URL}/Events/geteventdata"
+        resp = self.session.get(ev_data_endpoint, params={"eventtype": eventtype, "eventid": eventid})
+        if resp.status_code == 200:
+            full_event_data['details'] = resp.json()
+        
+        print("    Fetching Alert Levels & Vulnerability...")
+        alert_endpoint = f"{self.BASE_URL}/Events/geteventalertlevel"
+        resp = self.session.get(alert_endpoint, params={"eventtype": eventtype, "eventid": eventid})
+        if resp.status_code == 200:
+            full_event_data['alerts'] = resp.json()
+
+        print("    Fetching Media / News Articles...")
+        news_endpoint = f"{self.BASE_URL}/Emm/getemmnewsbykey"
+        resp = self.session.get(news_endpoint, params={"eventtype": eventtype, "eventid": eventid, "limit": 500})
+        if resp.status_code == 200:
+            full_event_data['news_articles'] = resp.json()
+
+        print("    Fetching Media Statistics...")
+        stats_endpoint = f"{self.BASE_URL}/Emm/getemmnewsstatisticbykey"
+        resp = self.session.get(stats_endpoint, params={"eventtype": eventtype, "eventid": eventid})
+        if resp.status_code == 200:
+            full_event_data['news_stats'] = resp.json()
+
+        if 'details' in full_event_data and 'properties' in full_event_data['details']:
+            props = full_event_data['details']['properties']
+            
+            impact_results =[]
+            impacts = props.get('impacts',[])
+            print(f"    Fetching {len(impacts)} Impact Resource(s)...")
+            for imp in impacts:
+                resources = imp.get('resource', {})
+                for key, url in resources.items():
+                    try:
+                        imp_resp = self.session.get(url)
+                        if imp_resp.status_code == 200:
+                            impact_results.append({key: imp_resp.json()})
+                    except:
+                        pass
+            full_event_data['impact_analysis'] = impact_results
+
+        return full_event_data
+
+    def run_pipeline(self, event_alias, start_date, end_date, country, min_mag=7.0):
+        
+        base_event = self.search_events(start_date, end_date, country, "EQ", min_mag)
+        
+        if not base_event:
+            return None
+            
+        deep_data = self.get_deep_data(base_event['eventtype'], base_event['eventid'])
+        
+        final_record = {
+            "search_metadata": base_event,
+            "deep_data": deep_data
         }
-
-        event_data['vulnerability_score'] = props.get('vulnerability', props.get('severitydata', {}).get('vulnerability', None))
         
-        print(f"    -> Fetching Media Intelligence for {event_data['name']}...")
-        rw_stats = self._fetch_reliefweb_stats(country, event_date)
+        filename = f"{event_alias.replace(' ', '_').lower()}.json"
+        filepath = os.path.join("data", "raw", filename)
         
-        event_data['media_article_count'] = rw_stats['count']
-        event_data['top_headlines'] = rw_stats['headlines']
-        
-        return event_data
-
-    def _fetch_reliefweb_stats(self, country, date_str):
-        try:
-            dt = datetime.fromisoformat(date_str.replace('Z', ''))
-            date_from = dt.strftime('%Y-%m-%dT00:00:00+00:00')
-            date_to = (dt + timedelta(days=30)).strftime('%Y-%m-%dT23:59:59+00:00')
-
-            payload = {
-                "appname": "gdacs_assignment",
-                "query": {
-                    "value": f"primary_country.name:\"{country}\" AND disaster.type:\"Earthquake\""
-                },
-                "filter": {
-                    "field": "date.created",
-                    "value": {
-                        "from": date_from,
-                        "to": date_to
-                    }
-                },
-                "limit": 50,
-                "fields": {"include": ["title", "source", "date"]}
-            }
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(final_record, f, indent=4)
             
-            resp = requests.post(self.RELIEFWEB_API_URL, json=payload, timeout=10)
-            data = resp.json()
-            
-            return {
-                "count": data.get('totalCount', 0),
-                "headlines": [item['fields']['title'] for item in data.get('data', [])]
-            }
-        except Exception:
-            return {"count": 0, "headlines": []}
+        print(f"Successfully saved comprehensive data to {filepath}\n")
+        return final_record
 
 if __name__ == "__main__":
-    scraper = DisasterScraper()
+    scraper = GDACSDeepScraper()
     
-    print("--- Test: Historical Event ---")
-    haiti = scraper.fetch_event_data("2021-08-14", "2021-08-20", event_type="EQ", country="Haiti")
-    print(haiti)
+    scraper.run_pipeline(
+        event_alias="Haiti_2021",
+        start_date="2021-08-01T00:00:00",
+        end_date="2021-09-01T00:00:00",
+        country="Haiti",
+        min_mag=7.0
+    )
 
-    print("\n--- Test: Recent Event ---")
-    myanmar = scraper.fetch_event_data("2025-01-01", "2026-03-02", event_type="EQ", country="Myanmar")
-    print(myanmar)
+    scraper.run_pipeline(
+        event_alias="Myanmar_2025",
+        start_date="2025-03-01T00:00:00",
+        end_date="2025-04-30T00:00:00",
+        country="Myanmar",
+        min_mag=7.5
+    )
